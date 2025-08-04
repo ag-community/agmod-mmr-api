@@ -5,11 +5,6 @@ import {
   calculateIndividualPerformance,
   calculatePerformanceAdjustment,
 } from './performance';
-import {
-  calculateInitialMMR,
-  calculateInitialRating,
-  calculateSkillProxy,
-} from './rating';
 import { determineWinner, organizeTeams } from './team';
 import { Player } from 'src/players/player.entity';
 
@@ -65,16 +60,14 @@ export class AGMMRCalculator {
     const { blueTeam, redTeam } = organizeTeams(matchDetails);
 
     // Retrieve current OpenSkill ratings for all players on both teams
-    // Creates initial ratings for new players based on their first match performance
     const blueRatings = blueTeam.map((match) =>
-      this.getOrCreatePlayerRating(match.player.steamID, match),
+      this.getOrCreatePlayerRating(match.player.steamID),
     );
     const redRatings = redTeam.map((match) =>
-      this.getOrCreatePlayerRating(match.player.steamID, match),
+      this.getOrCreatePlayerRating(match.player.steamID),
     );
 
     // Calculate average skill level for each team to determine balance
-    // Used later for upset detection and MMR adjustment scaling
     const blueAvgSkill = this.calculateTeamSkill(blueRatings);
     const redAvgSkill = this.calculateTeamSkill(redRatings);
     const skillDifference = Math.abs(blueAvgSkill - redAvgSkill);
@@ -83,7 +76,6 @@ export class AGMMRCalculator {
     const winner = determineWinner(blueTeam, redTeam);
 
     // Analyze individual player performance relative to match averages
-    // This creates performance scores that account for K/D, damage, and efficiency
     const playerPerformances = new Map<string, PlayerPerformance>();
     matchDetails.forEach((player) => {
       const performance = calculateIndividualPerformance(player, matchDetails);
@@ -91,11 +83,10 @@ export class AGMMRCalculator {
     });
 
     // Update OpenSkill ratings based on match outcome
-    // OpenSkill uses Bayesian inference to update player skill estimates
     const newRatings =
       winner === 'blue'
-        ? rate([blueRatings, redRatings], { rank: [1, 2] }) // Blue wins (rank 1)
-        : rate([blueRatings, redRatings], { rank: [2, 1] }); // Red wins (rank 1)
+        ? rate([blueRatings, redRatings], { rank: [1, 2] })
+        : rate([blueRatings, redRatings], { rank: [2, 1] });
 
     // Cache the updated ratings for future matches
     [blueTeam, redTeam].forEach((team, teamIdx) => {
@@ -108,13 +99,16 @@ export class AGMMRCalculator {
       });
     });
 
-    // Convert OpenSkill rating changes to MMR point changes with various adjustments
     [blueTeam, redTeam].forEach((team, teamIdx) => {
       team.forEach((match, idx) => {
         const steamId = match.player.steamID;
         const previousMatchDetail = previousMatchDetails[steamId];
         const isFirstMatch = previousMatchDetail === null;
-        const previousMMR = previousMatchDetail?.mmrAfterMatch ?? 0;
+
+        const previousMMR = isFirstMatch
+          ? 1000
+          : previousMatchDetail.mmrAfterMatch;
+
         const isWinner =
           (winner === 'blue' && teamIdx === 0) ||
           (winner === 'red' && teamIdx === 1);
@@ -123,64 +117,51 @@ export class AGMMRCalculator {
         const newRating = newRatings[teamIdx]?.[idx];
         const performance = playerPerformances.get(steamId)!;
 
-        let mmrAfterMatch: number;
-        let mmrDelta: number;
+        // Base MMR change from OpenSkill rating adjustment
+        const baseMMRChange = this.convertRatingChangeToMMR(
+          oldRating,
+          newRating,
+        );
 
-        if (isFirstMatch) {
-          // Special handling for new players - use placement match logic
-          mmrAfterMatch = calculateInitialMMR(newRating, performance);
-          mmrDelta = mmrAfterMatch;
-        } else {
-          // Standard MMR calculation for established players
+        // Performance-based adjustment (rewards individual play)
+        const performanceAdjustment = calculatePerformanceAdjustment(
+          performance,
+          isWinner,
+          team.length,
+        );
 
-          // Base MMR change from OpenSkill rating adjustment
-          const baseMMRChange = this.convertRatingChangeToMMR(
-            oldRating,
-            newRating,
-          );
+        // Balance factor adjusts MMR changes based on expected vs actual outcomes
+        const balanceFactor = this.calculateBalanceFactor(
+          skillDifference,
+          isWinner,
+          teamIdx === 0 ? blueAvgSkill : redAvgSkill,
+          teamIdx === 0 ? redAvgSkill : blueAvgSkill,
+        );
 
-          // Performance-based adjustment (rewards individual play)
-          const performanceAdjustment = calculatePerformanceAdjustment(
-            performance,
-            isWinner,
-            team.length,
-          );
+        // Carry adjustment rewards players who outperform teammates
+        const carryAdjustment = this.calculateCarryAdjustment(
+          match,
+          team,
+          performance,
+          isWinner,
+        );
 
-          // Balance factor adjusts MMR changes based on expected vs actual outcomes
-          // Upsets (weaker team winning) result in larger MMR swings
-          const balanceFactor = this.calculateBalanceFactor(
-            skillDifference,
-            isWinner,
-            teamIdx === 0 ? blueAvgSkill : redAvgSkill,
-            teamIdx === 0 ? redAvgSkill : blueAvgSkill,
-          );
+        // Store total adjustment for debugging/transparency
+        performance.adjustment = performanceAdjustment + carryAdjustment;
 
-          // Carry adjustment rewards players who outperform teammates
-          // or penalizes players who get carried by better teammates
-          const carryAdjustment = this.calculateCarryAdjustment(
-            match,
-            team,
-            performance,
-            isWinner,
-          );
+        // Combine all factors to get final MMR change
+        const mmrDelta = Math.round(
+          (baseMMRChange + performanceAdjustment + carryAdjustment) *
+            balanceFactor,
+        );
 
-          // Store total adjustment for debugging/transparency
-          performance.adjustment = performanceAdjustment + carryAdjustment;
-
-          // Combine all factors to get final MMR change
-          mmrDelta = Math.round(
-            (baseMMRChange + performanceAdjustment + carryAdjustment) *
-              balanceFactor,
-          );
-
-          // Apply bounds to prevent extreme MMR changes and ensure minimum movement
-          mmrDelta = this.clampMMRDelta(mmrDelta, isWinner);
-          mmrAfterMatch = Math.max(0, previousMMR + mmrDelta);
-        }
+        // Apply bounds to prevent extreme MMR changes and ensure minimum movement
+        const clampedMMRDelta = this.clampMMRDelta(mmrDelta, isWinner);
+        const mmrAfterMatch = Math.max(0, previousMMR + clampedMMRDelta);
 
         // Update the match detail with calculated MMR values
         match.mmrAfterMatch = mmrAfterMatch;
-        match.mmrDelta = mmrDelta;
+        match.mmrDelta = isFirstMatch ? mmrAfterMatch : clampedMMRDelta;
       });
     });
 
@@ -372,21 +353,14 @@ export class AGMMRCalculator {
   /**
    * Retrieves existing player rating or creates initial rating for new players
    *
-   * For new players, calculates a skill proxy based on their first match
-   * performance and creates an appropriate starting OpenSkill rating.
+   * All new players start with standard OpenSkill defaults.
    *
    * @param steamID - Unique player identifier
-   * @param matchDetail - Player's match data (used for initial rating if new)
    * @returns OpenSkill Rating object for the player
    */
-  private getOrCreatePlayerRating(
-    steamID: string,
-    matchDetail: MatchDetail,
-  ): Rating {
+  private getOrCreatePlayerRating(steamID: string): Rating {
     if (!this._playerRatings.has(steamID)) {
-      // New player - analyze their first match to estimate initial skill
-      const skillProxy = calculateSkillProxy(matchDetail);
-      const initialRating = calculateInitialRating(skillProxy);
+      const initialRating = rating({ mu: 25.0, sigma: 8.333 });
       this._playerRatings.set(steamID, initialRating);
     }
     return this._playerRatings.get(steamID)!;
